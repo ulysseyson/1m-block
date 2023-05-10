@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <string>
 #include <sstream>
+#include <fstream>
+#include <unordered_set>
 
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
@@ -14,7 +16,7 @@ using namespace std;
 
 // don't know how to give parameter to cb function.
 // set global variable
-string host;
+unordered_set<string> host_list;
 
 void usage(){
     printf("syntax : 1m-block <site list file>\n");
@@ -28,83 +30,68 @@ void dump(unsigned char* buf, int size) {
 			printf("\n");
 		printf("%02X ", buf[i]);
 	}
-	printf("\n");
+	printf("\n"); 
 }
 
-int hostcheck(unsigned char* buf){
-	printf("%s", host.c_str());
+int hostcheck(string buf){
 	// return 0 if host is not same as buf
-	for(int i = 0; i < host.size(); i++){
-		if(host[i] != buf[i]){
-			return 1;
-		}
-	}
-	return 0;
+	if(host_list.find(buf) == host_list.end()) return 0;
+	else return 1;
 }
 
 bool filter(unsigned char* buf, int size){
 	int ip_header_len = (buf[0] & 0xf )* 4;
+	int ip_type = buf[9];
     string packet_host;
+	if(ip_type != 0x06){
+		return false;
+	}
 	buf += ip_header_len;
 	size -= ip_header_len;
-	printf("\nremove ip header\n");
-	printf("ip header len %d", ip_header_len);
-	printf("\n");
 
 	// check tcp port
 	int tcp_dst_port = buf[2] * 256 + buf[3];
 	
-	printf("\ntcp dst port is %d\n", tcp_dst_port);
 
-	if(tcp_dst_port == 80) {
-		printf("http checked\n");
-		int tcp_header_len = 20;
-		buf += tcp_header_len;
-		size -= tcp_header_len;
+	if(tcp_dst_port != 80) {
+		return false;
+	}
+	int tcp_header_len = 20;
+	buf += tcp_header_len;
+	size -= tcp_header_len;
 
-		char H = 0x48;
-		char o = 0x6f;
-		char s = 0x73;
-		char t = 0x74;
-		char _ = 0x3a;
+	char H = 0x48;
+	char o = 0x6f;
+	char s = 0x73;
+	char t = 0x74;
+	char _ = 0x3a;
 
-		int check = 0;
-		printf("http protocol packet\n");
-		for(int j=0;j<size;j++){
-			if(j%16 == 0){
-				printf("\n");
-			}
-			printf("%02x ", buf[j]);
-		}
-		for (int i = 0; i < size; i++) {
+	int check = 0;
+	for (int i = 0; i < size; i++) {
 
-			if(check == 0 && buf[i] == H){
-				// printf("HHHHHHH\n");
-				if(buf[i+1] == o){
-					// printf("ooooooo\n");
-					if(buf[i+2] == s){
-						// printf("ssssss\n");
-						if(buf[i+3] == t){
-							// printf("tttttt\n");
-							if(buf[i+4] == _){
-								buf += (i+6);
-								size -= (i+6);
-                                packet_host = (char*)buf;
-                                packet_host = packet_host.substr(0, packet_host.find("\r\n"));
+		if(check == 0 && buf[i] == H){
+			if(buf[i+1] == o){
+				if(buf[i+2] == s){
+					if(buf[i+3] == t){
+						if(buf[i+4] == _){
+							buf += (i+6);
+							size -= (i+6);
+							packet_host = (char*)buf;
+							packet_host = packet_host.substr(0, packet_host.find("\r\n"));
 
-                                printf("%s", packet_host.c_str());
-								int host_equal = hostcheck(buf);
-								if(!host_equal){
-									printf("\n\n-----------------------\nthis is bad host!!\n");
-									return true;
-								}
-								else return false;
+							printf("\nhost extracted %s\n", packet_host.c_str());
+							int host_equal = hostcheck(packet_host);
+							if(host_equal){
+								printf("\n\n-----------------------\nthis is malicious host!!\n");
+								return true;
 							}
+							else return false;
 						}
 					}
 				}
 			}
 		}
+	
 	}
 	return false;
 }
@@ -121,8 +108,8 @@ static u_int32_t print_pkt (struct nfq_data *tb)
 	ph = nfq_get_msg_packet_hdr(tb);
 	if (ph) {
 		id = ntohl(ph->packet_id);
-		printf("hw_protocol=0x%04x hook=%u id=%u ",
-			ntohs(ph->hw_protocol), ph->hook, id);
+		// printf("hw_protocol=0x%04x hook=%u id=%u ",
+			// ntohs(ph->hw_protocol), ph->hook, id);
 	}
 
 	return id;
@@ -137,12 +124,11 @@ static bool filter_pkt (struct nfq_data *tb){
 	unsigned char *data;
 
 	ret = nfq_get_payload(tb, &data);
-	if (ret >= 0)
-        printf("\n");
-        // dump(data, ret);
+	if (ret >= 0){
 		bool is_filtered = filter(data, ret);
-		printf("payload_len=%d\n", ret);
-	return is_filtered;
+		return is_filtered;
+	}
+	return 0;
 }
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
@@ -150,7 +136,7 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 {
 	u_int32_t id = print_pkt(nfa);
 	int is_filtered = filter_pkt(nfa);
-	printf("entering callback\n");
+	// printf("entering callback\n");
 	if(is_filtered){
 		printf("fbi warning. pls go out.\n");
 		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
@@ -158,12 +144,21 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	else return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
+void read_file(string filename){
+	ifstream file(filename);
+	string str;
+	while(getline(file, str)){
+		str=str.substr(str.find(",")+1, str.length());
+		host_list.insert(str);
+	}
+}
+
 int main(int argc, char** argv)
 {
     if(argc != 2){
         usage();
     }
-    host = argv[1];
+    string file_name = argv[1];
 
 	struct nfq_handle *h;
 	struct nfq_q_handle *qh;
@@ -171,6 +166,13 @@ int main(int argc, char** argv)
 	int fd;
 	int rv;
 	char buf[4096] __attribute__ ((aligned));
+
+	read_file(file_name);
+
+	for(string s:host_list){
+		printf("%s", s.c_str());
+		break;
+	}
 
 	printf("opening library handle\n");
 	h = nfq_open();
@@ -208,7 +210,7 @@ int main(int argc, char** argv)
 
 	for (;;) {
 		if ((rv = recv(fd, buf, sizeof(buf), 0)) >= 0) {
-			printf("pkt received\n");
+			// printf("pkt received\n");
 			nfq_handle_packet(h, buf, rv);
 			continue;
 		}
